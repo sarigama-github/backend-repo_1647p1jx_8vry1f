@@ -1,5 +1,7 @@
 import os
 import tempfile
+import shutil
+import subprocess
 from typing import List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -45,26 +47,85 @@ def health():
     return {"status": "ok"}
 
 
+TMP_PARENT = tempfile.gettempdir()
+PUBLIC_ROOT = os.path.join(TMP_PARENT, "ytclips_public")
+if not os.path.exists(PUBLIC_ROOT):
+    os.makedirs(PUBLIC_ROOT, exist_ok=True)
+
+
+def _ensure_public_link(workdir: str):
+    base = os.path.basename(workdir)
+    link = os.path.join(PUBLIC_ROOT, base)
+    if not os.path.exists(link):
+        try:
+            os.symlink(workdir, link)
+        except Exception:
+            # Fallback: copy tree if symlink not permitted (best-effort, not ideal for big files)
+            try:
+                if not os.path.exists(link):
+                    shutil.copytree(workdir, link)
+            except Exception:
+                pass
+    return link
+
+
+@app.middleware("http")
+async def link_generated_dirs(request: Request, call_next):
+    path = request.url.path
+    if path.startswith("/clips/"):
+        parts = path.split("/")
+        if len(parts) >= 4:
+            workdir_name = parts[2]
+            _ensure_public_link(os.path.join(TMP_PARENT, workdir_name))
+    response = await call_next(request)
+    return response
+
+
+app.mount("/clips", StaticFiles(directory=PUBLIC_ROOT), name="clips")
+
+
+def _run(cmd: List[str]):
+    try:
+        completed = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+        return completed.stdout.strip(), completed.stderr.strip()
+    except subprocess.CalledProcessError as e:
+        raise HTTPException(status_code=500, detail=f"Command failed: {' '.join(cmd)} | {e.stderr.strip()}")
+
+
 @app.post("/api/clip", response_model=List[ClipInfo])
 def create_clips(payload: ClipRequest):
-    """
-    Download the YouTube video to a temp file, slice it into N clips of 60 seconds,
-    and return a list of direct download URLs (served from a temp directory).
-    """
-    # Lazy import heavy deps so the server can start even if optional deps are missing
+    # Lazy import yt_dlp and imageio_ffmpeg
     try:
         import yt_dlp  # type: ignore
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"yt-dlp not available: {e}")
 
     try:
-        from moviepy.editor import VideoFileClip  # type: ignore
+        from imageio_ffmpeg import get_ffmpeg_exe  # type: ignore
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"moviepy not available: {e}")
+        raise HTTPException(status_code=500, detail=f"imageio-ffmpeg not available: {e}")
 
-    # Prepare tmp working dir per request
+    ffmpeg_path = get_ffmpeg_exe()
+    if not os.path.exists(ffmpeg_path):
+        raise HTTPException(status_code=500, detail="ffmpeg binary not found")
+
+    # Prepare working directory
     workdir = tempfile.mkdtemp(prefix="ytclip_")
     video_path = os.path.join(workdir, "source.mp4")
+
+    # 0) Probe metadata (duration) without full download when possible
+    info = None
+    try:
+        with yt_dlp.YoutubeDL({"quiet": True, "noprogress": True}) as ydl:
+            info = ydl.extract_info(str(payload.url), download=False)
+    except Exception:
+        info = None
 
     # 1) Download best mp4 using yt-dlp
     ydl_opts = {
@@ -81,19 +142,35 @@ def create_clips(payload: ClipRequest):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Download failed: {e}")
 
-    # 2) Load with moviepy to get duration
-    try:
-        clip = VideoFileClip(video_path)
-        total = float(clip.duration or 0)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load video: {e}")
+    # Determine total duration (prefer metadata; as fallback, let ffmpeg read it)
+    total: float = 0.0
+    if info and isinstance(info, dict) and info.get("duration"):
+        try:
+            total = float(info.get("duration", 0.0))
+        except Exception:
+            total = 0.0
+
+    if total <= 0:
+        # Fallback: ask ffmpeg to print duration via show_entries
+        # Some ffmpeg builds include ffprobe; imageio-ffmpeg may not. We'll parse duration from stderr of ffmpeg -i
+        try:
+            _, err = _run([ffmpeg_path, "-i", video_path])
+            # Parse 'Duration: 00:01:23.45'
+            import re
+            m = re.search(r"Duration: (\d+):(\d+):(\d+\.?\d*)", err)
+            if m:
+                h = float(m.group(1))
+                mnt = float(m.group(2))
+                s = float(m.group(3))
+                total = h * 3600 + mnt * 60 + s
+        except Exception:
+            pass
 
     if total <= 0:
         raise HTTPException(status_code=400, detail="Invalid video duration")
 
-    # Determine start times
+    # Start times
     import random
-
     one_minute = 60.0
     max_start = max(0.0, total - one_minute)
 
@@ -101,74 +178,36 @@ def create_clips(payload: ClipRequest):
     if payload.strategy == "random":
         for _ in range(payload.count):
             starts.append(round(random.uniform(0, max_start), 3))
-    else:  # sequential by default
+    else:
         start_time = payload.start if payload.start is not None else 0.0
         for i in range(payload.count):
             s = min(start_time + i * one_minute, max_start)
             starts.append(round(s, 3))
 
-    # 3) Cut and write each subclip
+    # Ensure public link prepared
+    _ensure_public_link(workdir)
+
+    # 2) Produce subclips with ffmpeg directly
     results: List[ClipInfo] = []
     for i, s in enumerate(starts):
-        sub = clip.subclip(s, min(s + one_minute, total))
         out_path = os.path.join(workdir, f"clip_{i+1:02d}.mp4")
-        try:
-            sub.write_videofile(
-                out_path,
-                codec="libx264",
-                audio_codec="aac",
-                temp_audiofile=os.path.join(workdir, f"temp_audio_{i}.m4a"),
-                remove_temp=True,
-                verbose=False,
-                logger=None,
-            )
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to write clip {i+1}: {e}")
-
-        # Expose via a static mount path
+        # Use -ss before -i for fast seek, and -t for duration
+        cmd = [
+            ffmpeg_path,
+            "-y",
+            "-ss", str(s),
+            "-t", str(min(one_minute, max(0.001, total - s))),
+            "-i", video_path,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-c:a", "aac",
+            out_path,
+        ]
+        _run(cmd)
         url = f"/clips/{os.path.basename(workdir)}/{os.path.basename(out_path)}"
         results.append(ClipInfo(index=i + 1, start=s, duration=min(one_minute, total - s), url=url))
 
-    # Keep resources mounted for download
-    clip.close()
-
     return results
-
-
-# Static files serving for generated clips
-TMP_PARENT = tempfile.gettempdir()
-PUBLIC_ROOT = os.path.join(TMP_PARENT, "ytclips_public")
-if not os.path.exists(PUBLIC_ROOT):
-    os.makedirs(PUBLIC_ROOT, exist_ok=True)
-
-# Symlink each workdir into PUBLIC_ROOT when used
-
-def _ensure_public_link(workdir: str):
-    base = os.path.basename(workdir)
-    link = os.path.join(PUBLIC_ROOT, base)
-    if not os.path.exists(link):
-        try:
-            os.symlink(workdir, link)
-        except Exception:
-            # If symlink fails (e.g., on limited FS), fallback to exposing the file directly later
-            pass
-    return link
-
-
-@app.middleware("http")
-async def link_generated_dirs(request: Request, call_next):
-    # if requesting /clips/<workdir>/<file>, ensure symlink exists
-    path = request.url.path
-    if path.startswith("/clips/"):
-        parts = path.split("/")
-        if len(parts) >= 4:
-            workdir_name = parts[2]
-            _ensure_public_link(os.path.join(TMP_PARENT, workdir_name))
-    response = await call_next(request)
-    return response
-
-
-app.mount("/clips", StaticFiles(directory=PUBLIC_ROOT), name="clips")
 
 
 if __name__ == "__main__":
